@@ -1,7 +1,6 @@
 # Uplift Modeling for SMS Targeting
 Customer segmentation and uplift modeling to optimize SMS targeting under budget constraints
 
-
 ## Overview
 When marketing budgets are limited, the goal is not to target customers who will visit anyway—but those whose behavior changes because of the message.
 
