@@ -40,6 +40,7 @@ To reproduce this project:
 2. Place the file in a `/data` folder
 3. Update the file path in the code if necessary
 
+Link to Dataset: https://www.kaggle.com/code/mrmorj/bigtarget-eda-uplift-model-insights-task/notebook#BIGTARGET-Hackathon-from-LENTA-and-Microsoft 
 
 ## Methodology
 
