@@ -26,6 +26,21 @@ This is a **causal inference and targeting problem**, not just a prediction prob
 
 ---
 
+## Data Access
+
+The dataset used in this project is publicly available:
+
+- Source: BIGTARGET dataset (LENTA + Microsoft)
+- Platform: Kaggle
+
+Due to file size limitations, the dataset is not included in this repository.
+
+To reproduce this project:
+1. Download the dataset from Kaggle
+2. Place the file in a `/data` folder
+3. Update the file path in the code if necessary
+
+
 ## Methodology
 
 ### 1. Data Preprocessing
