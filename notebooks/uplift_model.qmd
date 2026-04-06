@@ -1,0 +1,1711 @@
+---
+title: "Capstone"
+author: "Nuria Castellsague Kharbouch"
+format: pdf
+editor: visual
+---
+
+## Packages
+
+```{r, warning=FALSE, results=FALSE, message=FALSE}
+library(readr)
+library(dplyr)
+library(stringr)
+library(caret)
+library(ranger)
+library(pROC)
+```
+
+## Data Set
+
+```{r}
+target <- read.csv("/Users/nuria/Desktop/DS Capstone/BIGTARGET.csv")
+head(target, 1)
+```
+
+## Clean Data:
+
+```{r, warning=FALSE, results=FALSE, message=FALSE}
+#there's a lot of columns so i will need to 
+#scope down the variables i will be looking at 
+names(target)
+```
+
+## I will be using these variables throughout the project:
+
+-   CardHolder – customer ID
+
+-   group – treatment/ control (received SMS or didn't)
+
+-   response_att – outcome/ target (binary store visit)
+
+-   gender – F, M
+
+-   age
+
+-   children – number of children
+
+-   main_format – store type (1= grocery store, 0 = superstore)
+
+-   months_from_register – months since registration of SMS
+
+-   sale_sum\_\[3, 6, 12\]m_g\* – total spend in product group over last 3/6/12 months
+
+-   sale_count\_\[3, 6, 12\]m_g\* – number of items bought in product group over last 3/6/12 months
+
+-   cheque_count\_\[3, 6, 12\]m_g\* – number of receipts containing group in last 3/6/12 months
+
+-   food_share\_\[15d,1m\] – share of food in purchases (15 days/ 1 month)
+
+-   promo_share_15d – share of promo goods in basket (15 days)
+
+-   disc_sum_6m_g34 – discount sum over time window for a product group
+
+-   response_sms – share of responses to previous SMS (response = store visit)
+
+-   response_viber – share of responses to previous Viber messages (response = store visit)
+
+-   crazy_purchases_cheque_count\_\[1, 3, 6, 12\]m – receipts with "crazy campaign" items in those windows
+
+-   crazy_purchases_goods_count\_\[6, 12\]m – item count from crazy campaign in those windows
+
+-   k_var\_\* – coefficient of variation features (how variable behavior is)
+
+-   stdev\_\* – standard deviation/ variation behavior features
+
+-   perdelta_days_between_visits_15_30d – % change in time between visits across the month halves
+
+```{r}
+# helper: find a column name even if case differs (e.g., "CardHolder" vs "cardholder")
+get_col <- function(df, nm) {
+  hit <- names(df)[tolower(names(df)) == tolower(nm)]
+  if (length(hit) == 0) NA_character_ else hit[1]
+}
+
+# key columns to use 
+id_col     <- get_col(target, "CardHolder")
+treat_col  <- get_col(target, "group")
+y_col      <- get_col(target, "response_att")
+gender_col <- get_col(target, "gender")
+age_col    <- get_col(target, "age")
+kids_col   <- get_col(target, "children")
+fmt_col    <- get_col(target, "main_format")
+mreg_col   <- get_col(target, "months_from_register")
+
+# 1) clean character columns
+char_cols <- names(target)[vapply(target, is.character, logical(1))]
+for (cc in char_cols) {
+  target[[cc]] <- str_trim(target[[cc]])
+  target[[cc]][target[[cc]] == ""] <- NA
+}
+
+# 2) clean ID
+if (!is.na(id_col)) {
+  target[[id_col]] <- as.character(target[[id_col]])
+  target[[id_col]] <- str_trim(target[[id_col]])
+  target[[id_col]][target[[id_col]] == ""] <- NA
+}
+
+# 3) clean gender 
+if (!is.na(gender_col)) {
+  g <- str_trim(as.character(target[[gender_col]]))
+  g[g %in% c("", "Не определен", "не определен")] <- NA
+  g[g %in% c("М","M","m")] <- "M"
+  g[g %in% c("Ж","F","f")] <- "F"
+  target[[gender_col]] <- g
+}
+
+# 4) clean treatment 
+if (!is.na(treat_col)) {
+  t <- target[[treat_col]]
+  if (is.character(t)) {
+    tl <- str_to_lower(str_trim(t))
+    target[[treat_col]] <- case_when(
+      tl %in% c("treatment","treated","test","sms","1","yes","y","true") ~ 1L,
+      tl %in% c("control","0","no","n","false")                          ~ 0L,
+      TRUE                                                               ~ NA_integer_
+    )
+  } else {
+    target[[treat_col]] <- as.integer(t)
+    target[[treat_col]][!target[[treat_col]] %in% c(0L, 1L)] <- NA_integer_
+  }
+}
+
+# 5) clean response_att
+if (!is.na(y_col)) {
+  y <- target[[y_col]]
+  if (is.character(y)) {
+    yl <- str_to_lower(str_trim(y))
+    target[[y_col]] <- case_when(
+      yl %in% c("1","yes","y","true") ~ 1L,
+      yl %in% c("0","no","n","false") ~ 0L,
+      TRUE                            ~ NA_integer_
+    )
+  } else {
+    target[[y_col]] <- as.integer(y)
+    target[[y_col]][!target[[y_col]] %in% c(0L, 1L)] <- NA_integer_
+  }
+}
+
+# 6) gender = text (just in case)
+exclude_text <- na.omit(c(id_col, gender_col))
+char_to_num <- setdiff(char_cols, exclude_text)
+for (cc in char_to_num) {
+  target[[cc]] <- suppressWarnings(as.numeric(target[[cc]]))
+}
+
+# 7) inf / - inf with NA
+num_cols <- names(target)[vapply(target, is.numeric, logical(1))]
+for (nc in num_cols) {
+  target[[nc]][is.infinite(target[[nc]])] <- NA
+}
+
+# 8) rule-based cleaning for feature families (for PCA + models)
+count_cols <- names(target)[str_detect(names(target), "count")]
+sum_cols   <- names(target)[str_detect(names(target), "sum")]
+var_cols   <- names(target)[str_detect(names(target), "k_var|stdev|perdelta")]
+
+for (cc in intersect(count_cols, num_cols)) target[[cc]][target[[cc]] < 0] <- NA
+for (sc in intersect(sum_cols,   num_cols)) target[[sc]][target[[sc]] < 0] <- NA
+for (vc in intersect(var_cols,   num_cols)) target[[vc]][target[[vc]] < 0] <- NA
+
+# shares / rates usually live in [0, 1]
+share_cols <- names(target)[str_detect(names(target), "share|response_sms|response_viber|mean_discount_depth")]
+for (sh in intersect(share_cols, num_cols)) {
+  target[[sh]][target[[sh]] < 0 | target[[sh]] > 1] <- NA
+}
+
+# 9) basic ranged for demographics
+if (!is.na(age_col)  && age_col  %in% num_cols) target[[age_col]][target[[age_col]] < 0 | target[[age_col]] > 110] <- NA
+if (!is.na(kids_col) && kids_col %in% num_cols) target[[kids_col]][target[[kids_col]] < 0 | target[[kids_col]] > 20] <- NA
+if (!is.na(mreg_col) && mreg_col %in% num_cols) target[[mreg_col]][target[[mreg_col]] < 0 | target[[mreg_col]] > 600] <- NA
+
+# main_format should be 0/1 if present
+if (!is.na(fmt_col)) {
+  target[[fmt_col]] <- as.integer(target[[fmt_col]])
+  target[[fmt_col]][!target[[fmt_col]] %in% c(0L, 1L)] <- NA_integer_
+}
+
+# quick check
+if (!is.na(gender_col)) table(target[[gender_col]], useNA = "always")
+if (!is.na(treat_col))  table(target[[treat_col]],  useNA = "always")
+if (!is.na(y_col))      table(target[[y_col]],      useNA = "always")
+```
+
+## EDA – Exploratory Data Analysis:
+
+```{r}
+# check missing
+colMeans(is.na(target)) %>% sort(decreasing = TRUE) %>% head(20)
+```
+
+```{r, warning=FALSE, results=FALSE, message=FALSE}
+# ranges and outliers
+summary(select(target, where(is.numeric)))
+```
+
+```{r}
+# near-zero variance columns because of PCA
+nzv <- nearZeroVar(select(target, where(is.numeric)), saveMetrics = TRUE)
+row.names(nzv[nzv$nzv, ])
+```
+
+## Interpretations of EDA above:
+
+1.  There's a lot of missing values in k_var\_\* variables, so they won't be very useful unless I drop them or do careful imputation, especially before PCA.
+2.  The purchase variables are extremely zero-heavy and many spend variables are very skewed, which means PCA will work a lot better if I log-transform counts/ sums and scale the features first.
+3.  The columns listed in the third EDA chunk of code are those that don't change much across rows, so they won't help separate customer types. Therefore, these won't help PCA or clustering because they don't provide meaningful differences.
+
+#### Before PCA, I will do more EDA checks:
+
+This chunk of code is due to the large number of median = 0 – which won't help segmentation. Therefore, I must identify what these columns are.
+
+```{r}
+#not using treatment / outcome
+num_cols <- target %>% select(where(is.numeric))
+X <- num_cols %>% select(-any_of(c("group","response_att")))  
+
+zero_rate <- sapply(X, function(v) mean(v == 0, na.rm = TRUE))
+sort(zero_rate, decreasing = TRUE) |> head(20)
+```
+
+I will also be checking the missing-ness by treatment group, to make sure they don't very for = 0 and = 1.
+
+```{r}
+miss_by_group <- target %>%
+  group_by(group) %>%
+  summarise(across(where(is.numeric), ~mean(is.na(.x))), .groups = "drop")
+
+miss_by_group
+```
+
+#### Additional EDA Interpretations:
+
+1.  The variables in the first chunk above show that they won't help me with separating customer types unless the non-zero values capture a real meaningful behavior difference. I won't drop these just because they have a lot of zeros, but I'll be prepared for the PCA to likely create components that mainly represent rare non-zero behavior. I will be dropping variables with extremely zero-heavy (over 95% zeros).
+2.  The second chunk of code show that there isn't any meaningful difference between the treated vs. control. However, I will need to drop columns with high missing columns (over 70%).
+
+I will also check for extreme outliers in spend/ count so I can decide whether log1p() is the right move.
+
+```{r}
+miss_by_group <- target %>%
+  group_by(group) %>%
+  summarise(across(where(is.numeric), ~mean(is.na(.x))), .groups = "drop")
+
+miss_by_group
+```
+
+#### Do I need to use log1p?
+
+3.  I will use log1p, which will especially be helpful for any \*\_sum\_\* (spend) columns and any count columns that survive the dropping rules.
+
+## PCA + k=4 segments + Uplift-by-Segment Pipeline:
+
+(includes log1p)
+
+```{r}
+library(irlba)
+
+set.seed(1)
+
+# 1) Build PCA feature set (numeric only) (no treatment/ outcome)
+exclude <- c("group", "response_att", "CardHolder")  
+
+X <- target %>%
+  select(where(is.numeric)) %>%
+  select(-any_of(exclude))
+
+# just in-case for V age
+if ("age" %in% names(X)) X$age[X$age == 0] <- NA
+
+# 2) drop columns with more than 95% zeros
+zero_rate <- sapply(X, function(v) mean(v == 0, na.rm = TRUE))
+drop_zero <- names(zero_rate)[zero_rate > 0.95]
+
+X1 <- X %>% select(-any_of(drop_zero))
+
+
+# 3) drop columns with more than 70% missing rows 
+miss_by_group <- target %>%
+  group_by(group) %>%
+  summarise(across(all_of(names(X1)), ~ mean(is.na(.x))), .groups = "drop")
+
+miss_max <- sapply(names(X1), function(nm) max(miss_by_group[[nm]], na.rm = TRUE))
+drop_missing <- names(miss_max)[miss_max > 0.70]
+
+X2 <- X1 %>% select(-any_of(drop_missing))
+
+# record of dropped columns -- just in case
+dropped_cols <- sort(unique(c(drop_zero, drop_missing)))
+
+
+# 4) apply log1p to skewed "sum/count" variables -- not for demographic or binaries 
+log_candidates <- names(X2)[str_detect(names(X2), "sum|count|cheque_count|sale_sum|sale_count|disc_sum|crazy_purchases")]
+
+no_log <- intersect(names(X2), c("age", "children", "months_from_register", "main_format"))
+log_cols <- setdiff(log_candidates, no_log)
+
+X3 <- X2
+X3[log_cols] <- lapply(X3[log_cols], log1p)
+
+
+# 5) median imputation for missing values of columns that weren't dropped (not above 70% rows missing) 
+X4 <- X3
+for (nm in names(X4)) {
+  if (anyNA(X4[[nm]])) {
+    med <- median(X4[[nm]], na.rm = TRUE)
+    X4[[nm]][is.na(X4[[nm]])] <- med
+  }
+}
+
+
+# 6) scale + PCA (fit PCA on a sample for speed, then project everyone)
+idx <- sample.int(nrow(X4), size = min(50000, nrow(X4)))
+# centered + scaled on the sample
+Xs <- scale(as.matrix(X4[idx, ]))  
+
+pca <- prcomp_irlba(Xs, n = 20, center = FALSE, scale. = FALSE)
+
+# project all customers into PCA space using the sam center/scale as the sample
+Xall <- scale(as.matrix(X4),
+              center = attr(Xs, "scaled:center"),
+              scale  = attr(Xs, "scaled:scale"))
+# PCA scores for all rows
+PC <- Xall %*% pca$rotation   
+
+
+# 7) k=4 clustering in PCA space
+km <- kmeans(PC[, 1:10, drop = FALSE], centers = 4, nstart = 20)
+target$segment4 <- factor(km$cluster)
+
+
+# 8) measure incremental impact (uplift) inside each segment
+uplift_by_segment <- target %>%
+  group_by(segment4) %>%
+  summarise(
+    n = n(),
+    treated_rate = mean(response_att[group == 1], na.rm = TRUE),
+    control_rate = mean(response_att[group == 0], na.rm = TRUE),
+    incremental = treated_rate - control_rate,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(incremental))
+
+uplift_by_segment
+
+
+# 9) prints for reports
+# how many dropped for >95% zeros
+length(drop_zero)   
+
+# how many dropped for >70% missing values
+length(drop_missing)  
+
+# final PCA-ready feature matrix dimensions
+dim(X4)      
+
+# preview dropped columns
+head(dropped_cols, 30) 
+```
+
+#### Interpretation of PCA + Uplift-by-segment Pipeline:
+
+-   Segment 2 is the best segment because it has the largest incremental lift from SMS (0.8 percentage points).
+
+-   Segment 1 has the highest overall visit rate (36%), but it's a smaller lift, which means that these customers would visit even without the SMS.
+
+-   Segment 4 has the lowest overall visit rate (3-4%), and it also has the smallest lift, which suggests this group is harder to convince.
+
+-   Segment 3 has about 7.97% of customers that visited, versus 7.38% of control customers. Therefore, SMS increased visits about 0.59%.
+
+-   Segment 2 seems to have the most positive reaction to receiving SMS. However, it seems to be helpful in every segment.
+
+##### *Review of the 4 customer types:*
+
+1.  Do-Not-Disturbs: treated_rate \< control_rate (negative incremental)
+2.  Lost Cause: both rates are low and incremental is near 0
+3.  Sure Thing: both rates are high and incremental is near 0
+4.  Persuadable: treated_rate \> control_rate (positive incremental), especially when the lift is relatively large
+
+## Segments Vs. Customer Types:
+
+Segment 1 = Sure Things
+
+-   Control is \~0.358 and treated is \~0.363 (both very high), and the lift is small.
+
+-   Therefore, will likely visit anyway.
+
+Segment 2 = Persuadables
+
+-   This has the largest lift (+0.00795).
+
+-   Therefore, SMS increases customers' visits.
+
+Segment 3 = Persuadables (but weaker than Segment 2 Persuadables)
+
+-   This segment also has a positive lift (+0.00586), but it's smaller than segment 2's lift.
+
+-   These customers are still motivated by SMS, but less strongly.
+
+Segment 4 = Lost Causes
+
+-   The treated and control rates are very low (\~0.037 versus \~0.033), and the lift is the smallest.
+
+-   It's not the most perfect example of a "Lost Cause" customer type, because the lift is still positive, however it's the closest of the four segments.
+
+## Uplift-by-Segment Confidence Intervals:
+
+```{r}
+uplift_by_segment_ci <- target %>%
+  group_by(segment4) %>%
+  summarise(
+    n = n(),
+    n_treat = sum(group == 1, na.rm = TRUE),
+    n_ctrl  = sum(group == 0, na.rm = TRUE),
+    treated_rate = mean(response_att[group == 1], na.rm = TRUE),
+    control_rate = mean(response_att[group == 0], na.rm = TRUE),
+    incremental = treated_rate - control_rate,
+    se = sqrt(treated_rate*(1-treated_rate)/n_treat + control_rate*(1-control_rate)/n_ctrl),
+    ci_low = incremental - 1.96*se,
+    ci_high = incremental + 1.96*se,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(incremental))
+
+uplift_by_segment_ci
+```
+
+#### Interpretation of Uplift-by-segment Confidence Intervals:
+
+Segment 2:
+
+-   137,484 customers with 103,968 treated and 33,516 control.
+
+-   The treated visit rate is 17.71% and the control visit rate is 16.91%.
+
+-   The estimated lift is +0.00795 (\~0.80%).
+
+-   The 95% confidence interval is \[0.00331, 0.01259\], which completely above 0.
+
+-   This means Segment 2 is the strongest Persuadable group.
+
+Segment 3:
+
+-   212,033 customers with 158,767 treated and 53,266 control.
+
+-   The treated visit rate is 7.97% and the control visit rate is 7.38%.
+
+-   The estimated lift is +0.00586 (\~0.59%).
+
+-   The 95% confidence interval is \[0.00328, 0.00845\], which is also completely above 0.
+
+-   This means Segment 3 is also a Persuadable group, but it's weaker than Segment 2.
+
+Segment 1:
+
+-   65,917 customers with 50,024 treated and 15,893 control.
+
+-   The treated visit rate is 36.33% and the control visit rate is 35.83%.
+
+-   The estimated lift is +0.00507 (\~0.51%)
+
+-   The 95% confidence interval is \[-0.00349, 0.01364\], which crosses 0.
+
+-   This means one cannot be confident the SMS truly increased the visits for Segment 1, and the observed difference could be due to random variation.
+
+-   This still fits the Sure Things, as they tended to visit regardless.
+
+Segment 4:
+
+-   271,595 customers with 203,133 treated and 68,462 control.
+
+-   The treated visit rate is 3.73% and the control visit rate is 3.30%.
+
+-   The estimated lift is +0.00427 (\~0.43%).
+
+-   The 95% confidence interval is \[0.00270, 0.00585\], which is completely above 0.
+
+-   This means the SMS effect for Segment 4 is very likely positive, but the overall rates are still low, so this segment remains the closest to a Lost Cause group, because it's still hard to get a reaction with SMS.
+
+## 4-Class Prediction Model:
+
+```{r, warning=FALSE, results=FALSE, message=FALSE}
+library(ranger)
+
+set.seed(1)
+
+target$segment4 <- factor(target$segment4)
+
+# build feature matrix (same as PCA features) 
+exclude <- c("group", "response_att", "segment4", "CardHolder")
+
+X <- target %>%
+  select(where(is.numeric)) %>%
+  select(-any_of(exclude))
+
+# for age variable
+if ("age" %in% names(X)) X$age[X$age == 0] <- NA
+
+# drop 95% zeros 
+zero_rate <- sapply(X, function(v) mean(v == 0, na.rm = TRUE))
+drop_zero <- names(zero_rate)[zero_rate > 0.95]
+X1 <- X %>% select(-any_of(drop_zero))
+
+# drop 70% missing values
+miss_by_group <- target %>%
+  group_by(group) %>%
+  summarise(across(all_of(names(X1)), ~ mean(is.na(.x))), .groups = "drop")
+
+miss_max <- sapply(names(X1), function(nm) max(miss_by_group[[nm]], na.rm = TRUE))
+drop_missing <- names(miss_max)[miss_max > 0.70]
+X2 <- X1 %>% select(-any_of(drop_missing))
+
+# log1p for skewed count/sum-type features
+log_candidates <- names(X2)[str_detect(names(X2), "sum|count|cheque_count|sale_sum|sale_count|disc_sum|crazy_purchases")]
+
+# don't log
+no_log <- intersect(names(X2), c("age", "children", "months_from_register", "main_format"))
+log_cols <- setdiff(log_candidates, no_log)
+
+X3 <- X2
+X3[log_cols] <- lapply(X3[log_cols], log1p)
+
+# median imputation 
+X4 <- X3
+for (nm in names(X4)) {
+  if (anyNA(X4[[nm]])) {
+    med <- median(X4[[nm]], na.rm = TRUE)
+    X4[[nm]][is.na(X4[[nm]])] <- med
+  }
+}
+
+# build modeling dataset
+df_model <- bind_cols(
+  segment4 = target$segment4,
+  as.data.frame(X4)
+)
+
+# train/test split (stratified)
+idx <- createDataPartition(df_model$segment4, p = 0.8, list = FALSE)
+train_df <- df_model[idx, ]
+test_df  <- df_model[-idx, ]
+
+# speed-up for bigger dataset 
+set.seed(1)
+train_df <- train_df %>% sample_n(min(150000, nrow(train_df)))
+
+# train multiclass model (random forest via ranger)
+ctrl <- trainControl(
+  method = "cv",
+  number = 5
+)
+
+set.seed(1)
+fit_4class <- train(
+  segment4 ~ .,
+  data = train_df,
+  method = "ranger",
+  trControl = ctrl,
+  tuneLength = 3,
+  importance = "impurity"
+)
+
+fit_4class
+
+# evaluate on test set
+pred <- predict(fit_4class, newdata = test_df)
+cm <- confusionMatrix(pred, test_df$segment4)
+cm
+
+# most important variables
+var_imp <- varImp(fit_4class)
+var_imp
+```
+
+#### 4-Class Prediction Model Interpretation:
+
+The model above was trained using 150,000 customers and 188 variables to predict the 4 segment predictors. The model did 5-fold-cross-validation, which means it trained and tested itself 5 times on different splits to estimate how well it will generalize.
+
+The model tried different settings for mtry and splitrule to see which combination performs best.
+
+**Accuracy**: percent of customers predicted into the correct segment by model
+
+**Kappa**: stricter score that accounts for the fact that some segments are more common than others, so it measures performance beyond "guessing the majority class."
+
+The best settings was mtry = 2, and splitrule = extratrees. This means the model did best when each split considered only 2 variables at a time, and used the extra-trees style splitting rule.
+
+-   The fact that mtry = 2 worked best suggests that the predictors are highly correlated/ redundant, so looking at too many variables at once likely hurt performance.
+
+The model accuracy is 0.9522, which means it predicted the correct segment for the customers about 95.% of the time. The confidence interval for accuracy is (0.951, 0.9533), which means the true accuracy is likely very class to 95%.
+
+The No Information Rate (0.3953) is what you'd get if you always guessed the most common segment. The model having an extremely better rate than this, means the model performed well.
+
+The Kappa is 0.9312, which is very high, meaning the performance of the model is strong, even after adjusting for the class imbalance in each segment.
+
+The confusion matrix shows the model is usually correct, and most mistakes happen between neighboring segments rather than totally wrong segments. The model is really good at predicting Segment 4, because it almost never confuses it with other segments.
+
+-   The most common errors are:
+
+    -   Segment 1 predicted as Segment 2
+
+    -   Segment 2 predicted as Segment 3
+
+    -   Segment 3 predicted as Segment 2 or 4
+
+        -   This pattern suggests the segments aren't completely separate, and some customers sit near "boundaries" between segment types, which is to be expected with customer behavior.
+
+Sensitivity means: Out of all the customers truly in each segment, how many did we correctly find.
+
+-   Segment 4 sensitivity is 0.9919, so the model finds almost all Segment 4 customers correctly.
+
+-   Segment 3 sensitivity is 0.9474, so it finds most Segment 3 customers correctly.
+
+-   Segment 2 sensitivity is 0.9240, so it finds most Segment 2 customers correctly.
+
+-   Segment 1 sensitivity is 0.8625, so Segment 1 is the hardest segment to identify, and it gets confused with Segment 2 sometimes.
+
+    -   Balanced Accuracy is high for all segments, which means performance is strong even when you consider both true positives and true negatives.
+
+**Most important variables:**
+
+-   cheque_count\_\* variables (how often customers have receipts in certain groups/time windows.)
+
+-   sale_sum\_\* variables (how much customers spend in certain groups/time windows.)
+
+-   sale_count\_\* variables (how many items they buy.)
+
+-   disc_sum\_\* variables (how much discount they receive/use.)
+
+    -   This means the segments are being defined mostly by how often customers shop and how much they spend in certain product categories, which is exactly what you would expect from behavioral segmentation.
+
+**In Conclusion:**
+
+-   The model is very strong – because it predicts customer segment about 95% of the time, and it performs well across all segments.
+
+-   The model is especially strong for Segment 4, and it's the weakest for Segment 1, mostly because Segment 1 and Segment 2 look somewhat similar in the predictors.
+
+-   The most important predictors are purchase frequency and spending features, which shows you segmentation is being driven by meaningful customer behavior patterns.
+
+## Persuadables Model:
+
+Taking into account the PCA and 4-class prediction model, I believe clumping Segments 2 and 3 together for the Persuadables Model. Segment 2 and Segment 3 both have clear positive uplift with confidence intervals above 0, so they meet the definition of persuadables – customers who respond positively when contacted. The confusion matrix also shows the 4-class prediction model sometimes confuses segment 2 and segment 3 with each other, which means they're behaviorally similar and separating them perfectly is harder than just prediction "persuadable vs. not."
+
+-   Persuadable = Segments 2 and 3
+
+-   No persuadable = Segments 1 and 4
+
+```{r}
+set.seed(1)
+
+# create binary target label
+
+target <- target %>%
+  mutate(
+    segment4 = factor(segment4),
+    persuadable = factor(
+      if_else(segment4 %in% c("2", "3"), "persuadable", "other"),
+      levels = c("persuadable", "other")
+    )
+  )
+
+# ensure gender is clean (M/F/NA) and encode as numeric for the model
+#    (F=1, M=0, NA stays NA)
+if ("gender" %in% names(target)) {
+  g <- str_trim(as.character(target$gender))
+  g[g %in% c("", "Не определен", "не определен")] <- NA
+  g[g %in% c("М","M","m")] <- "M"
+  g[g %in% c("Ж","F","f")] <- "F"
+  target$gender <- g
+  target$gender_F <- ifelse(is.na(target$gender), NA_real_, ifelse(target$gender == "F", 1, 0))
+} else {
+  target$gender_F <- NA_real_
+}
+
+# build predictor matrix (numeric only) excluding treatment/outcome/segment labels
+exclude <- c("group", "response_att", "segment4") 
+# keep demographics like age/children/months/main_format if numeric
+X <- target %>%
+  select(where(is.numeric)) %>%
+  select(-any_of(exclude))
+
+# ensure gender_F is included (if created)
+if (!("gender_F" %in% names(X)) && "gender_F" %in% names(target)) {
+  X <- bind_cols(X, gender_F = target$gender_F)
+}
+
+# if age==0 is really "unknown" in your data, treat it as missing
+if ("age" %in% names(X)) X$age[X$age == 0] <- NA
+
+# drop columns with >95% zeros (extremely zero-heavy)
+zero_rate <- sapply(X, function(v) mean(v == 0, na.rm = TRUE))
+drop_zero <- names(zero_rate)[zero_rate > 0.95]
+X1 <- X %>% select(-any_of(drop_zero))
+
+# drop columns with >70% missing values
+miss_by_group <- target %>%
+  group_by(group) %>%
+  summarise(across(all_of(names(X1)), ~ mean(is.na(.x))), .groups = "drop")
+
+miss_max <- sapply(names(X1), function(nm) max(miss_by_group[[nm]], na.rm = TRUE))
+drop_missing <- names(miss_max)[miss_max > 0.70]
+X2 <- X1 %>% select(-any_of(drop_missing))
+
+dropped_cols <- sort(unique(c(drop_zero, drop_missing)))
+
+# log1p where it fits (counts/sums/crazy/discount sums), but not demographics/binaries
+log_candidates <- names(X2)[str_detect(names(X2), "sum|count|cheque_count|sale_sum|sale_count|disc_sum|crazy_purchases")]
+
+no_log <- intersect(names(X2), c("age", "children", "months_from_register", "main_format", "gender_F"))
+log_cols <- setdiff(log_candidates, no_log)
+
+X3 <- X2
+X3[log_cols] <- lapply(X3[log_cols], log1p)
+
+# median imputation on remaining missing values 
+X4 <- X3
+for (nm in names(X4)) {
+  if (anyNA(X4[[nm]])) {
+    med <- median(X4[[nm]], na.rm = TRUE)
+    X4[[nm]][is.na(X4[[nm]])] <- med
+  }
+}
+
+# build modeling dataset + Train/test split (stratified)
+df_model <- bind_cols(persuadable = target$persuadable, as.data.frame(X4))
+
+idx <- createDataPartition(df_model$persuadable, p = 0.80, list = FALSE)
+train_df <- df_model[idx, ]
+test_df  <- df_model[-idx, ]
+
+# Speed control on big data
+set.seed(1)
+train_df <- train_df %>% sample_n(min(150000, nrow(train_df)))
+
+# train binary model (ranger) using settings inspired by your strong 4-class results
+p <- ncol(train_df) - 1
+
+rf_persuadable <- ranger(
+  persuadable ~ .,
+  data = train_df,
+  num.trees = 500,
+  mtry = 2,                 
+# 4-class best used mtry=2
+  splitrule = "extratrees", 
+# 4-class best used extratrees
+  min.node.size = 1,
+  probability = TRUE,
+  importance = "impurity",
+  num.threads = max(1, parallel::detectCores() - 1)
+)
+
+# confusion matrix + AUC
+prob <- predict(rf_persuadable, data = test_df)$predictions[, "persuadable"]
+pred_class <- factor(ifelse(prob >= 0.5, "persuadable", "other"), levels = c("persuadable", "other"))
+
+cm <- confusionMatrix(pred_class, test_df$persuadable)
+cm
+
+roc_obj <- roc(response = test_df$persuadable, predictor = prob, levels = c("other", "persuadable"))
+auc(roc_obj)
+
+# top 20 important variables
+vi <- sort(rf_persuadable$variable.importance, decreasing = TRUE)
+top20 <- data.frame(variable = names(vi)[1:min(20, length(vi))],
+                    importance = as.numeric(vi[1:min(20, length(vi))]))
+top20
+
+# ranges of important variables for Persuadables vs Others
+# top predictors + demographics (age/children/months_from_register/main_format/gender_F if present)
+demographics <- intersect(names(X4), c("age", "children", "months_from_register", "main_format", "gender_F"))
+top_vars <- unique(c(top20$variable[1:min(10, nrow(top20))], demographics))
+top_vars <- top_vars[top_vars %in% names(df_model)]
+
+range_one_var <- function(df, v) {
+  pdat <- df[df$persuadable == "persuadable", v, drop = TRUE]
+  odat <- df[df$persuadable == "other", v, drop = TRUE]
+  data.frame(
+    variable = v,
+    persuadable_q10 = as.numeric(quantile(pdat, 0.10, na.rm = TRUE)),
+    persuadable_q50 = as.numeric(quantile(pdat, 0.50, na.rm = TRUE)),
+    persuadable_q90 = as.numeric(quantile(pdat, 0.90, na.rm = TRUE)),
+    other_q10 = as.numeric(quantile(odat, 0.10, na.rm = TRUE)),
+    other_q50 = as.numeric(quantile(odat, 0.50, na.rm = TRUE)),
+    other_q90 = as.numeric(quantile(odat, 0.90, na.rm = TRUE))
+  )
+}
+
+ranges_table <- do.call(rbind, lapply(top_vars, function(v) range_one_var(df_model, v)))
+ranges_table
+
+# demographic proportions for gender in words
+if ("gender_F" %in% names(df_model)) {
+  gender_summary <- df_model %>%
+    group_by(persuadable) %>%
+    summarise(
+      female_share = mean(gender_F == 1, na.rm = TRUE),
+      male_share   = mean(gender_F == 0, na.rm = TRUE),
+      gender_missing_share = mean(is.na(gender_F)),
+      .groups = "drop"
+    )
+  gender_summary
+}
+
+# quick record of dropped
+length(drop_zero)
+length(drop_missing)
+head(dropped_cols, 30)
+```
+
+#### Persuadables Prediction Model Interpretation:
+
+-   The model correctly classified customers as Persuadable (Segment 2 or 3) vs. Other (Segment 1 or 4) with 96.82% accuracy.
+
+-   The AUC is 0.9967, which is almost perfect, meaning the model separates persuadables from non-persuadables very well.
+
+-   The Kappa is 0.9363, which means the performance is still very strong even after accounting for the fact that the classes are fairly balanced.
+
+Confusion Matrix:
+
+-   The model correctly identifies 68,322 persuadables as persuadable.
+
+-   The model incorrectly labels 2,791 non-persuadables as persuadable (false positives).
+
+-   The model misses 1,581 persuadables by labelling them as "other" (false negatives).
+
+-   Overall, the model makes a few mistakes, and it's better at not missing persuadables than it is at never messaging non-persuadables.
+
+Sensitivity, specificity, and precision mean:
+
+-   The sensitivity is 0.9774, which means the model finds about 97.7% of all true persuadables, so it rarely misses them.
+
+-   The specificity is 0.9587, which means it correctly rejects about 95.9% of non-persuadables, so it usually avoids mislabeling them.
+
+-   The positive predictive value is 0.9608, which means when the model says this person is persuadable, it's correct about 96.1% of the time.
+
+Preprocessing rules were applied correctly!
+
+-   The output \[1\] 0 means no variables were dropped for being over 95% zeros based on the columns included.
+
+-   The output \[1\] 4 means 4 variables were dropped for being over 70% missing, and it lists those exact four k_var\_\* variables.
+
+-   This matches your plan of removing "too missing to be reliable" variables.
+
+**Important variables to predict persuadables:**
+
+*Spending and shopping frequency features to identify persuadables.*
+
+-   Variables such as sale_sum_6m_g24, sale_sum_12m_g24, and sale_sum_12m_g44 are important because they capture how much a customer spends in certain categories over the last 6-12 months.
+
+-   Variables like cheque_count_12m_g46, cheque_count_12m_g33, and cheque_count_12m_g48 are important because they capture how often the customer shops or appears in receipts for those groups.
+
+-   Discount behavior (disc_sum_6m_g34 and discount variability feature like k_var_disc_share_6m_g24) matters because it captures how much customers interact with discounts, which often relates to responsiveness to promotions.
+
+**Ranges:** *shown in log scale because I used log1p().*
+
+-   0 corresponds to an originla value of 0
+
+-   I will convert them back to original units below:
+
+Regardless, for the top spend variables, persuadables tend to have higher spending, because their median log-speed values are high and non-zero.
+
+-   Persuadables have higher typical value in variables like sale_sum_6m_g24 and sale_sum_12m_g24 compared to "other" suggests persuadables are more active shoppers in these categories.
+
+```{r}
+ranges_table_fixed <- ranges_table %>%
+  mutate(
+    is_log1p = variable %in% log_cols
+  ) %>%
+  mutate(
+    across(
+      .cols = c(persuadable_q10, persuadable_q50, persuadable_q90,
+                other_q10, other_q50, other_q90),
+      .fns = ~ ifelse(is_log1p, exp(.x) - 1, .x)
+    )
+  ) %>%
+  select(-is_log1p)
+
+ranges_table_fixed
+```
+
+Interpretation:
+
+-   This table compares Persudables (Segments 2 and 3) vs. "Other" (Segments 1 and 4) using the 10th percentile, median, and 90th percentile for each important variable.
+
+-   Persuadables are mainly identified by shopping behavior, because they have higher typical spend and receipt counts (for example, higher medians for sale_sum\_\* and cheque_count\_\*).
+
+-   Many "Others" have 0 at the low end for several spend variables, which means a chunk of non-persuadables show little or no spending in those categories/ time windows.
+
+-   Demographics don't separate the groups much, because the median age (42) and children (0) are basically the same, and months_from_register is only slightly higher for persuadables (37 vs. 32).
+
+-   main_format suggests persuadables are concentrated in store format 0, and gender is only slightly different between groups.
+
+**Demographics:**
+
+-   Age distribution is the same for persudables and "other" because both groups have a median age of 42 and very similar ranges
+
+-   Children variable is also similar because both groups have a median of 0 and similar upper ranges
+
+-   month_from_register is slightly higher for persuadables at the median (37 vs. 32), which suggests persuadables may be slightly more established customers, but the difference isn't huge.
+
+-   main_format shows persuadables are almost always 0 at the median and even at the 90th percentile, which suggests persuadables are concentrated in the store format coded as 0 in the data.
+
+-   gender_F and my gender summary show persuadables are slighly more female than the others (about 65.1% female vs. 63.9% female), but the difference is small.
+
+Overall:
+
+-   The model suggests persuadables are best identified using shopping activity variable (spend and receipt frequency) and discount behavior, and demographics play a smaller role compared to behavioral data.
+
+-   Segment 2 and 3 customers are persuadables, so this model can help a company target customers most likely to increase store visits messaged, instead of texting anyone.
+
+## Visualizations:
+
+#### Volume of each customer group:
+
+```{r}
+library(ggplot2)
+
+volume_df <- data.frame(
+  segment = c("Segment 1\n(Sure Things)", 
+              "Segment 2\n(Persuadables)", 
+              "Segment 3\n(Weaker Persuadables)", 
+              "Segment 4\n(Lost Causes)"),
+  n = c(65917, 137484, 212033, 271595)
+)
+
+ggplot(volume_df, aes(x = reorder(segment, n), y = n, fill = segment)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = scales::comma(n)), hjust = -0.1, size = 4) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c("#2ecc71", "#3498db", "#e67e22", "#e74c3c")) +
+  labs(
+    title = "Customer Volume by Segment",
+    subtitle = "Segment 4 (Lost Causes) is the largest group — large SMS budget waste",
+    x = NULL, y = "Number of Customers"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+#### Uplift Bar Chart with Confidence Intervals:
+
+```{r}
+uplift_ci_df <- data.frame(
+  segment = c("Segment 2\n(Persuadables)", 
+              "Segment 3\n(Weaker Persuadables)", 
+              "Segment 1\n(Sure Things)", 
+              "Segment 4\n(Lost Causes)"),
+  incremental = c(0.00795, 0.00586, 0.00507, 0.00427),
+  ci_low      = c(0.00331, 0.00328, -0.00349, 0.00270),
+  ci_high     = c(0.01259, 0.00845,  0.01364, 0.00585)
+)
+
+ggplot(uplift_ci_df, aes(x = reorder(segment, incremental), y = incremental, color = segment)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2, linewidth = 1) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_color_manual(values = c("#e74c3c", "#e67e22", "#3498db", "#2ecc71")) +
+  labs(
+    title = "SMS Uplift by Customer Segment",
+    subtitle = "Segment 1 CI crosses zero — effect not statistically significant",
+    x = NULL, y = "Incremental Lift (Treated - Control)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+#### Segment Profile Radar/ Spider Chart:
+
+```{r}
+library(fmsb)
+library(dplyr)
+
+# compute real means per segment from your actual data
+radar_raw <- target %>%
+  dplyr::group_by(segment4) %>%
+  dplyr::summarise(
+    avg_spend_6m  = mean(sale_sum_6m_g24,      na.rm = TRUE),
+    visit_freq    = mean(cheque_count_12m_g46, na.rm = TRUE),
+    discount_use  = mean(disc_sum_6m_g34,      na.rm = TRUE),
+    months_reg    = mean(months_from_register, na.rm = TRUE),
+    response_rate = mean(response_att,         na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(segment4)
+
+# pull just the numeric columns
+radar_vals <- radar_raw %>%
+  dplyr::select(-segment4) %>%
+  as.data.frame()
+
+rownames(radar_vals) <- c(
+  "Seg 1: Sure Things",
+  "Seg 2: Persuadables",
+  "Seg 3: Weaker Persuadables",
+  "Seg 4: Lost Causes"
+)
+
+# fmsb requires max row and min row as first two rows
+max_vals <- apply(radar_vals, 2, max) * 1.1
+min_vals <- rep(0, ncol(radar_vals))
+
+radar_input <- rbind(max_vals, min_vals, radar_vals)
+
+# colors
+colors_seg <- c("#2ecc71", "#3498db", "#e67e22", "#e74c3c")
+
+# make a lot more room on the right
+par(mar = c(1, 1, 3, 12), xpd = TRUE)
+
+radarchart(
+  radar_input,
+  axistype   = 1,
+  pcol       = colors_seg,
+  pfcol      = adjustcolor(colors_seg, alpha.f = 0.2),
+  plwd       = 2,
+  cglcol     = "grey80",
+  cglty      = 1,
+  axislabcol = "grey40",
+  vlcex      = 0.85,
+  title      = "Segment Behavioral Profiles"
+)
+
+legend(
+  1.35, 1.2,
+  legend = rownames(radar_vals),
+  col    = colors_seg,
+  lty    = 1,
+  lwd    = 2,
+  bty    = "n",
+  cex    = 0.8
+)
+```
+
+#### Variable Importance Plot:
+
+```{r, warning=FALSE, results=FALSE, message=FALSE}
+library(ranger)
+library(caret)
+
+set.seed(1)
+target$segment4 <- factor(target$segment4)
+
+exclude <- c("group", "response_att", "segment4", "CardHolder")
+X <- target %>%
+  dplyr::select(where(is.numeric)) %>%
+  dplyr::select(-any_of(exclude))
+
+if ("age" %in% names(X)) X$age[X$age == 0] <- NA
+
+zero_rate <- sapply(X, function(v) mean(v == 0, na.rm = TRUE))
+drop_zero <- names(zero_rate)[zero_rate > 0.95]
+X1 <- X %>% dplyr::select(-any_of(drop_zero))
+
+miss_by_group <- target %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(across(all_of(names(X1)), ~ mean(is.na(.x))), .groups = "drop")
+miss_max <- sapply(names(X1), function(nm) max(miss_by_group[[nm]], na.rm = TRUE))
+drop_missing <- names(miss_max)[miss_max > 0.70]
+X2 <- X1 %>% dplyr::select(-any_of(drop_missing))
+
+log_candidates <- names(X2)[str_detect(names(X2), "sum|count|cheque_count|sale_sum|sale_count")]
+no_log <- intersect(names(X2), c("age", "children", "months_from_register", "main_format"))
+log_cols <- setdiff(log_candidates, no_log)
+X3 <- X2
+X3[log_cols] <- lapply(X3[log_cols], log1p)
+
+X4 <- X3
+for (nm in names(X4)) {
+  if (anyNA(X4[[nm]])) {
+    med <- median(X4[[nm]], na.rm = TRUE)
+    X4[[nm]][is.na(X4[[nm]])] <- med
+  }
+}
+
+df_model <- bind_cols(
+  segment4 = target$segment4,
+  as.data.frame(X4)
+)
+
+idx <- createDataPartition(df_model$segment4, p = 0.8, list = FALSE)
+train_df <- df_model[idx, ]
+test_df  <- df_model[-idx, ]
+
+set.seed(1)
+train_df <- train_df %>% dplyr::sample_n(min(150000, nrow(train_df)))
+
+ctrl <- trainControl(method = "cv", number = 5)
+
+set.seed(1)
+fit_4class <- train(
+  segment4 ~ .,
+  data       = train_df,
+  method     = "ranger",
+  trControl  = ctrl,
+  tuneLength = 3,
+  importance = "impurity"
+)
+
+saveRDS(fit_4class, "fit_4class.rds")
+```
+
+```{r}
+var_imp <- varImp(fit_4class)
+
+var_imp_df <- var_imp$importance %>%
+  tibble::rownames_to_column("variable") %>%
+  tidyr::pivot_longer(
+    cols      = -variable,
+    names_to  = "segment",
+    values_to = "importance"
+  ) %>%
+  mutate(segment = recode(segment,
+    `1` = "Seg 1: Sure Things",
+    `2` = "Seg 2: Persuadables",
+    `3` = "Seg 3: Weaker Persuadables",
+    `4` = "Seg 4: Lost Causes"
+  )) %>%
+  group_by(segment) %>%
+  slice_max(importance, n = 10) %>%
+  ungroup()
+
+ggplot(var_imp_df, aes(x = reorder(variable, importance), y = importance, fill = segment)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  coord_flip() +
+  facet_wrap(~ segment, scales = "free_y") +
+  scale_fill_manual(values = c("#2ecc71", "#3498db", "#e67e22", "#e74c3c")) +
+  labs(
+    title    = "Top 10 Variable Importance by Segment",
+    subtitle = "What behavioral features define each customer segment",
+    x        = NULL,
+    y        = "Importance (Scaled 0-100)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.text      = element_text(face = "bold", size = 11),
+    axis.text.y     = element_text(size = 8)
+  )
+```
+
+#### Confusion Matrix Heat-map:
+
+```{r}
+cm_data <- data.frame(
+  Predicted = factor(rep(c("1","2","3","4"), each = 4), levels = c("1","2","3","4")),
+  Actual    = factor(rep(c("1","2","3","4"), times = 4), levels = c("1","2","3","4")),
+  Count     = c(
+    11370,    76,     0,     0,
+     1813, 25406,   152,     0,
+        0,  2014, 40177,   439,
+        0,     0,  2077, 53880
+  )
+)
+
+ggplot(cm_data, aes(x = Actual, y = Predicted, fill = Count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = scales::comma(Count)), size = 4.5) +
+  scale_fill_gradient(low = "#eaf4fb", high = "#2980b9", labels = scales::comma) +
+  labs(
+    title    = "Confusion Matrix — 4-Class Segment Model",
+    subtitle = "Errors cluster between neighboring segments (1→2, 2→3, 3→4)",
+    x        = "Actual Segment", y = "Predicted Segment", fill = "Count"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## NEW CODE FOR VISUALIZATIONS:
+
+#### Packages (just in case)
+
+```{r, warning=FALSE, results=FALSE, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(forcats)
+library(scales)
+library(caret)
+library(irlba)
+library(gridExtra)
+```
+
+#### Verify key objects from pipeline above:
+
+```{r, warning=FALSE, results=FALSE, message=FALSE}
+set.seed(1)
+
+# Make sure segment4 is a factor
+target$segment4 <- factor(target$segment4, levels = c("1", "2", "3", "4"))
+
+# Build feature matrix exactly in the style of your PDF
+exclude <- c("group", "response_att", "segment4", "CardHolder")
+
+X <- target %>%
+  select(where(is.numeric)) %>%
+  select(-any_of(exclude))
+
+# Treat age == 0 as missing if applicable
+if ("age" %in% names(X)) X$age[X$age == 0] <- NA
+
+# Drop columns with >95% zeros
+zero_rate <- sapply(X, function(v) mean(v == 0, na.rm = TRUE))
+drop_zero <- names(zero_rate)[zero_rate > 0.95]
+X1 <- X %>% select(-any_of(drop_zero))
+
+# Drop columns with >70% missing in either treatment/control group
+miss_by_group <- target %>%
+  group_by(group) %>%
+  summarise(across(all_of(names(X1)), ~ mean(is.na(.x))), .groups = "drop")
+
+miss_max <- sapply(names(X1), function(nm) max(miss_by_group[[nm]], na.rm = TRUE))
+drop_missing <- names(miss_max)[miss_max > 0.70]
+X2 <- X1 %>% select(-any_of(drop_missing))
+
+# log1p for skewed count/sum-type features
+log_candidates <- names(X2)[str_detect(names(X2),
+                                       "sum|count|cheque_count|sale_sum|sale_count|disc_sum|crazy_purchases")]
+no_log <- intersect(names(X2), c("age", "children", "months_from_register", "main_format"))
+log_cols <- setdiff(log_candidates, no_log)
+
+X3 <- X2
+X3[log_cols] <- lapply(X3[log_cols], log1p)
+
+# Median imputation
+X4 <- X3
+for (nm in names(X4)) {
+  if (anyNA(X4[[nm]])) {
+    med <- median(X4[[nm]], na.rm = TRUE)
+    X4[[nm]][is.na(X4[[nm]])] <- med
+  }
+}
+
+# modeling dataset
+df_model <- bind_cols(
+  segment4 = target$segment4,
+  as.data.frame(X4)
+)
+```
+
+#### PCA object for scree plot + cluster visualization:
+
+```{r, warning=FALSE, results=FALSE, message=FALSE}
+# Scale before PCA
+X_scaled <- scale(X4)
+
+# PCA
+pca_fit <- prcomp(X_scaled, center = FALSE, scale. = FALSE)
+
+# PCA scores
+pca_scores <- as.data.frame(pca_fit$x[, 1:10])
+pca_scores$segment4 <- target$segment4
+```
+
+### Uplift bar chart with 95% confidence intervals:
+
+```{r}
+# Define segment colors
+colors_seg <- c(
+  "Segment 1 (Sure Things)" = "#2ecc71",
+  "Segment 2 (Persuadables)" = "#3498db",
+  "Segment 3 (Weaker Persuadables)" = "#e67e22",
+  "Segment 4 (Lost Causes)" = "#e74c3c"
+)
+
+# Uplift with counts and confidence intervals
+uplift_ci <- target %>%
+  group_by(segment4) %>%
+  summarise(
+    n = n(),
+    n_treated = sum(group == 1, na.rm = TRUE),
+    n_control = sum(group == 0, na.rm = TRUE),
+    treated_rate = mean(response_att[group == 1], na.rm = TRUE),
+    control_rate = mean(response_att[group == 0], na.rm = TRUE),
+    incremental = treated_rate - control_rate,
+    se = sqrt(
+      (treated_rate * (1 - treated_rate) / n_treated) +
+      (control_rate * (1 - control_rate) / n_control)
+    ),
+    ci_low = incremental - 1.96 * se,
+    ci_high = incremental + 1.96 * se,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    segment4 = factor(
+      segment4,
+      levels = c("1", "2", "3", "4"),
+      labels = c(
+        "Segment 1 (Sure Things)",
+        "Segment 2 (Persuadables)",
+        "Segment 3 (Weaker Persuadables)",
+        "Segment 4 (Lost Causes)"
+      )
+    )
+  ) %>%
+  arrange(desc(incremental))
+
+ggplot(
+  uplift_ci,
+  aes(
+    x = fct_reorder(segment4, incremental),
+    y = incremental,
+    fill = segment4
+  )
+) +
+  geom_col(width = 0.65) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.15, linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_fill_manual(values = colors_seg) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01)) +
+  labs(
+    title = "Incremental Uplift by Segment with 95% Confidence Intervals",
+    x = "Segment",
+    y = "Incremental Lift (Treated - Control)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+### Cluster: PCA Scatter-plots of the 4 segments:
+
+```{r}
+# If dataset is huge, sample for plotting speed
+set.seed(1)
+plot_df <- pca_scores %>%
+  mutate(
+    segment4 = factor(
+      segment4,
+      levels = c("1", "2", "3", "4"),
+      labels = c(
+        "Segment 1 (Sure Things)",
+        "Segment 2 (Persuadables)",
+        "Segment 3 (Weaker Persuadables)",
+        "Segment 4 (Lost Causes)"
+      )
+    )
+  ) %>%
+  sample_n(min(25000, n()))
+
+# Compute centroids for each segment in PC space
+centroids <- plot_df %>%
+  group_by(segment4) %>%
+  summarise(
+    PC1 = mean(PC1),
+    PC2 = mean(PC2),
+    .groups = "drop"
+  )
+
+ggplot(plot_df, aes(x = PC1, y = PC2, color = segment4)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_point(
+    data = centroids,
+    aes(x = PC1, y = PC2),
+    size = 5,
+    shape = 4,
+    stroke = 1.5,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title = "Cluster Visualization in PCA Space",
+    subtitle = "Customers projected onto PC1 and PC2, colored by 4-segment assignment",
+    x = "PC1",
+    y = "PC2",
+    color = "Segment"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### PCA Scree Plot:
+
+```{r}
+explained_var <- (pca_fit$sdev^2) / sum(pca_fit$sdev^2)
+
+scree_df <- tibble(
+  PC = seq_along(explained_var),
+  explained_var = explained_var,
+  cumulative_var = cumsum(explained_var)
+)
+
+ggplot(scree_df[1:20, ], aes(x = PC, y = explained_var)) +
+  geom_col(width = 0.7, fill = "#2980b9") +
+  geom_line(aes(y = cumulative_var), linewidth = 1, color = "#2980b9") +
+  geom_point(aes(y = cumulative_var), size = 2, color = "#2980b9") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = 1:20) +
+  labs(
+    title = "PCA Scree Plot",
+    subtitle = "Bars = individual variance explained, line = cumulative variance explained",
+    x = "Principal Component",
+    y = "Variance Explained"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Segment Profile Heat-map:
+
+```{r}
+# Variable importance table
+var_imp_df <- varImp(fit_4class)$importance %>%
+  tibble::rownames_to_column("variable") %>%
+  arrange(desc(Overall))
+
+top_profile_vars <- var_imp_df %>%
+  slice_head(n = 12) %>%
+  pull(variable)
+
+profile_df <- bind_cols(
+  segment4 = target$segment4,
+  X4[, top_profile_vars, drop = FALSE]
+) %>%
+  mutate(
+    segment4 = factor(
+      segment4,
+      levels = c("1", "2", "3", "4"),
+      labels = c(
+        "Segment 1 (Sure Things)",
+        "Segment 2 (Persuadables)",
+        "Segment 3 (Weaker Persuadables)",
+        "Segment 4 (Lost Causes)"
+      )
+    )
+  ) %>%
+  group_by(segment4) %>%
+  summarise(across(all_of(top_profile_vars), mean), .groups = "drop") %>%
+  pivot_longer(-segment4, names_to = "variable", values_to = "mean_value") %>%
+  group_by(variable) %>%
+  mutate(z_value = as.numeric(scale(mean_value))) %>%
+  ungroup()
+
+ggplot(profile_df, aes(x = variable, y = segment4, fill = z_value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "steelblue4", mid = "white", high = "firebrick3", midpoint = 0) +
+  labs(
+    title = "Segment Profile Heatmap",
+    subtitle = "Standardized mean values of top important variables by segment",
+    x = "Variable",
+    y = "Segment",
+    fill = "Z-score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+### Segment profile dot plot version:
+
+```{r}
+profile_df <- bind_cols(
+  segment4 = target$segment4,
+  X4[, top_profile_vars, drop = FALSE]
+) %>%
+  mutate(
+    segment4 = factor(
+      segment4,
+      levels = c("1", "2", "3", "4"),
+      labels = c(
+        "Segment 1 (Sure Things)",
+        "Segment 2 (Persuadables)",
+        "Segment 3 (Weaker Persuadables)",
+        "Segment 4 (Lost Causes)"
+      )
+    )
+  ) %>%
+  group_by(segment4) %>%
+  summarise(across(all_of(top_profile_vars), mean), .groups = "drop") %>%
+  pivot_longer(-segment4, names_to = "variable", values_to = "mean_value") %>%
+  group_by(variable) %>%
+  mutate(z_value = as.numeric(scale(mean_value))) %>%
+  ungroup()
+
+ggplot(profile_df, aes(x = z_value, y = fct_rev(variable), color = segment4)) +
+  geom_point(size = 3) +
+  facet_wrap(~ segment4, scales = "free_y") +
+  labs(
+    title = "Segment Profile Dot Plot",
+    subtitle = "Standardized segment means for top important variables",
+    x = "Standardized Mean (Z-score)",
+    y = "Variable",
+    color = "Segment"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+Confusion Matrix Heat-map:
+
+```{r}
+cm_df <- as.data.frame(cm$table)
+names(cm_df) <- c("Prediction", "Reference", "Freq")
+
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = comma(Freq)), size = 4) +
+  scale_fill_gradient(low = "white", high = "steelblue4") +
+  labs(
+    title = "Confusion Matrix Heatmap",
+    subtitle = "4-class random forest predictions vs actual segments",
+    x = "Actual Segment",
+    y = "Predicted Segment",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+Row-normalized confusion matrix Heat-map:
+
+```{r}
+cm_prop <- cm_df %>%
+  group_by(Reference) %>%
+  mutate(prop = Freq / sum(Freq)) %>%
+  ungroup()
+
+ggplot(cm_prop, aes(x = Reference, y = Prediction, fill = prop)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = percent(prop, accuracy = 0.1)), size = 4) +
+  scale_fill_gradient(low = "white", high = "darkgreen") +
+  labs(
+    title = "Normalized Confusion Matrix Heatmap",
+    subtitle = "Within-actual-segment percentages",
+    x = "Actual Segment",
+    y = "Predicted Segment",
+    fill = "Proportion"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Spending distribution box-plots:
+
+```{r}
+spend_vars <- c(
+  "sale_sum_6m_g24",
+  "sale_sum_6m_g33",
+  "sale_sum_12m_g24",
+  "sale_sum_12m_g44"
+)
+
+spend_plot_df <- target %>%
+  select(segment4, any_of(spend_vars)) %>%
+  pivot_longer(-segment4, names_to = "variable", values_to = "value") %>%
+  mutate(
+    segment4 = factor(
+      segment4,
+      levels = c("1", "2", "3", "4"),
+      labels = c(
+        "Segment 1 (Sure Things)",
+        "Segment 2 (Persuadables)",
+        "Segment 3 (Weaker Persuadables)",
+        "Segment 4 (Lost Causes)"
+      )
+    ),
+    log_value = log1p(value)
+  )
+
+ggplot(spend_plot_df, aes(x = segment4, y = log_value, fill = segment4)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    title = "Spending Distribution by Segment",
+    subtitle = "Boxplots use log1p-transformed spending variables",
+    x = "Segment",
+    y = "log1p(Value)",
+    fill = "Segment"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  )
+```
+
+### Receipt / frequency distribution Box Plots:
+
+```{r}
+freq_vars <- c(
+  "cheque_count_12m_g38",
+  "cheque_count_12m_g46",
+  "cheque_count_12m_g33",
+  "cheque_count_6m_g33"
+)
+
+freq_plot_df <- target %>%
+  select(segment4, any_of(freq_vars)) %>%
+  pivot_longer(-segment4, names_to = "variable", values_to = "value") %>%
+  mutate(
+    segment4 = factor(
+      segment4,
+      levels = c("1", "2", "3", "4"),
+      labels = c(
+        "Segment 1 (Sure Things)",
+        "Segment 2 (Persuadables)",
+        "Segment 3 (Weaker Persuadables)",
+        "Segment 4 (Lost Causes)"
+      )
+    ),
+    log_value = log1p(value)
+  )
+
+ggplot(freq_plot_df, aes(x = segment4, y = log_value, fill = segment4)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    title = "Purchase Frequency / Receipt Count Distribution by Segment",
+    subtitle = "Boxplots use log1p-transformed count variables",
+    x = "Segment",
+    y = "log1p(Value)",
+    fill = "Segment"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 40, hjust = 1)
+  )
+```
+
+### Treated vs control rate by segment:
+
+```{r}
+rate_plot_df <- uplift_ci %>%
+  select(segment4, treated_rate, control_rate) %>%
+  pivot_longer(
+    cols = c(treated_rate, control_rate),
+    names_to = "group_type",
+    values_to = "rate"
+  ) %>%
+  mutate(
+    group_type = recode(
+      group_type,
+      treated_rate = "Treated",
+      control_rate = "Control"
+    ),
+    segment4 = factor(
+      segment4,
+      levels = c("1", "2", "3", "4"),
+      labels = c(
+        "Segment 1 (Sure Things)",
+        "Segment 2 (Persuadables)",
+        "Segment 3 (Weaker Persuadables)",
+        "Segment 4 (Lost Causes)"
+      )
+    )
+  )
+
+ggplot(rate_plot_df, aes(x = segment4, y = rate, fill = group_type)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  scale_fill_manual(values = c("Control" = "#e74c3c", "Treated" = "#2ecc71")) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Treated vs Control Visit Rate by Segment",
+    x = "Segment",
+    y = "Visit Rate",
+    fill = ""
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+```
+
+### Segment size vs uplift bubble plot:
+
+```{r}
+bubble_df <- uplift_ci %>%
+  mutate(
+    segment4 = factor(
+      segment4,
+      levels = c("1", "2", "3", "4"),
+      labels = c(
+        "Sure Things",
+        "Persuadables",
+        "Weaker Persuadables",
+        "Lost Causes"
+      )
+    )
+  )
+
+ggplot(bubble_df, aes(x = n, y = incremental, size = n, color = segment4, label = segment4)) +
+  geom_point(alpha = 0.6) +
+  geom_text(
+    vjust = -0.4,
+    hjust = 0.5,
+    angle = 0,
+    size = 4,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = c(
+    "Sure Things" = "#2ecc71",
+    "Persuadables" = "#3498db",
+    "Weaker Persuadables" = "#e67e22",
+    "Lost Causes" = "#e74c3c"
+  )) +
+  scale_x_continuous(labels = comma_format()) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01)) +
+  labs(
+    title = "Segment Size vs Incremental Uplift",
+    subtitle = "Bigger bubbles = larger customer segments",
+    x = "Segment Size",
+    y = "Incremental Lift",
+    color = "Segment"
+  ) +
+  theme_minimal(base_size = 12) +
+  guides(size = "none")
+```
